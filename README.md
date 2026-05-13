@@ -1,6 +1,6 @@
 # USCIS Case Status Tracker
 
-Automated tracker for USCIS case **IOE0936799005** — checks status every 5 hours and sends email notifications to **swrp.vicky@gmail.com**.
+Automated tracker for USCIS case **** — checks status every 5 hours and sends email notifications to **swrp.vicky@gmail.com**.
 
 ## Features
 - Scrapes USCIS case status from the official website
