@@ -5,7 +5,6 @@ import requests
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from bs4 import BeautifulSoup
 
 # Configuration
 CASE_NUMBER = "IOE0936799005"
@@ -14,58 +13,91 @@ EMAIL_FROM = os.environ.get("EMAIL_FROM", "")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")
 STATUS_FILE = "last_status.json"
 
-USCIS_URL = "https://egov.uscis.gov/casestatus/mycasestatus.do"
+# USCIS public case status API
+USCIS_API_URL = "https://egov.uscis.gov/case-status/api/getCaseStatus"
 
 
 def get_case_status(case_number):
-    """Fetch case status from USCIS website."""
+    """Fetch case status using the USCIS public API."""
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://egov.uscis.gov/casestatus/mycasestatus.do",
+        "Origin": "https://egov.uscis.gov",
     }
-    payload = {"appReceiptNum": case_number, "caseStatusSearchBtn": "CHECK STATUS"}
+    params = {"appReceiptNum": case_number}
     try:
-        response = requests.post(USCIS_URL, data=payload, headers=headers, timeout=30)
+        response = requests.get(
+            USCIS_API_URL,
+            params=params,
+            headers=headers,
+            timeout=30,
+        )
         response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
+        data = response.json()
+        print(f"Raw API response: {json.dumps(data, indent=2)}")
 
-        # Extract status title
-        status_title = ""
-        title_tag = soup.find("h1")
-        if title_tag:
-            status_title = title_tag.get_text(strip=True)
-
-        # Extract status description
-        status_desc = ""
-        desc_tag = soup.find("p")
-        if desc_tag:
-            status_desc = desc_tag.get_text(strip=True)
-
-        # Fallback: look for the status div
+        # Parse the API response structure
+        case_status = data.get("caseStatus", {})
+        status_title = (
+            case_status.get("formType", "")
+            + " - "
+            + case_status.get("subStatus", "")
+        ).strip(" -")
         if not status_title:
-            status_div = soup.find("div", {"class": "rows text-center"})
-            if status_div:
-                h1 = status_div.find("h1")
-                p = status_div.find("p")
-                if h1:
-                    status_title = h1.get_text(strip=True)
-                if p:
-                    status_desc = p.get_text(strip=True)
+            status_title = case_status.get("current_case_status_text_en", "Unknown")
+        status_desc = case_status.get("current_case_status_desc_en", "No description available")
 
         return {
             "case_number": case_number,
             "status_title": status_title or "Unknown",
-            "status_description": status_desc or "No description available",
+            "status_description": status_desc,
+            "raw": case_status,
             "checked_at": datetime.utcnow().isoformat() + "Z",
         }
     except Exception as e:
-        print(f"Error fetching status: {e}")
-        return None
+        print(f"API request failed: {e}")
+        # Fallback: try the eVerify/external tracker endpoint
+        return get_case_status_fallback(case_number)
+
+
+def get_case_status_fallback(case_number):
+    """Fallback using alternate USCIS endpoint."""
+    try:
+        url = f"https://egov.uscis.gov/case-status/api/check-case/{case_number}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Referer": "https://egov.uscis.gov/",
+        }
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        print(f"Fallback API response: {json.dumps(data, indent=2)}")
+        status_title = data.get("subStatus", data.get("status", "Unknown"))
+        status_desc = data.get("description", "No description available")
+        return {
+            "case_number": case_number,
+            "status_title": status_title,
+            "status_description": status_desc,
+            "raw": data,
+            "checked_at": datetime.utcnow().isoformat() + "Z",
+        }
+    except Exception as e2:
+        print(f"Fallback also failed: {e2}")
+        # Return a placeholder so we still send an email with error info
+        return {
+            "case_number": case_number,
+            "status_title": "Unable to fetch - USCIS website blocked request",
+            "status_description": (
+                f"Both USCIS API endpoints returned errors. "
+                f"Please check manually at https://egov.uscis.gov/casestatus/mycasestatus.do "
+                f"using case number {case_number}. Error: {e2}"
+            ),
+            "raw": {},
+            "checked_at": datetime.utcnow().isoformat() + "Z",
+        }
 
 
 def load_last_status():
@@ -77,97 +109,106 @@ def load_last_status():
 
 
 def save_status(status):
-    """Save the current status to file."""
+    """Save current status to file."""
+    saveable = {k: v for k, v in status.items() if k != "raw"}
     with open(STATUS_FILE, "w") as f:
-        json.dump(status, f, indent=2)
+        json.dump(saveable, f, indent=2)
 
 
-def send_email(subject, body, is_html=False):
-    """Send an email notification."""
+def send_email(subject, body):
+    """Send HTML email notification."""
     if not EMAIL_FROM or not EMAIL_PASSWORD:
-        print("Email credentials not set. Skipping email.")
+        print("Email credentials not configured. Skipping email.")
         return False
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = EMAIL_FROM
         msg["To"] = EMAIL_TO
-        part = MIMEText(body, "html" if is_html else "plain")
-        msg.attach(part)
+        msg.attach(MIMEText(body, "html"))
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(EMAIL_FROM, EMAIL_PASSWORD)
             server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
-        print(f"Email sent to {EMAIL_TO}")
+        print(f"Email sent successfully to {EMAIL_TO}")
         return True
+    except smtplib.SMTPAuthenticationError as e:
+        print(f"SMTP Authentication failed: {e}")
+        return False
     except Exception as e:
         print(f"Failed to send email: {e}")
         return False
 
 
 def build_email_body(current, previous=None):
-    """Build a rich HTML email body."""
-    change_section = ""
-    if previous and previous["status_title"] != current["status_title"]:
-        change_section = f"""
-        <div style="background:#fff3cd;border:1px solid #ffc107;padding:12px;border-radius:6px;margin-bottom:16px;">
-            <strong>Status Changed!</strong><br>
-            <span style="color:#6c757d;">Previous:</span> {previous['status_title']}<br>
-            <span style="color:#28a745;">Current:</span> {current['status_title']}
-        </div>
-        """
-    return f"""
-    <html><body style="font-family:Arial,sans-serif;max-width:600px;margin:auto;padding:20px;">
-        <h2 style="color:#1a73e8;">USCIS Case Status Update</h2>
-        {change_section}
-        <table style="width:100%;border-collapse:collapse;">
-            <tr><td style="padding:8px;font-weight:bold;width:40%;">Case Number:</td>
-                <td style="padding:8px;">{current['case_number']}</td></tr>
-            <tr style="background:#f8f9fa;"><td style="padding:8px;font-weight:bold;">Current Status:</td>
-                <td style="padding:8px;color:#1a73e8;">{current['status_title']}</td></tr>
-            <tr><td style="padding:8px;font-weight:bold;">Description:</td>
-                <td style="padding:8px;">{current['status_description']}</td></tr>
-            <tr style="background:#f8f9fa;"><td style="padding:8px;font-weight:bold;">Checked At:</td>
-                <td style="padding:8px;">{current['checked_at']}</td></tr>
+    """Build HTML email body."""
+    change_banner = ""
+    if previous and previous.get("status_title") != current["status_title"]:
+        change_banner = f"""
+        <div style="background:#fff3cd;border-left:4px solid #ffc107;padding:14px 16px;border-radius:4px;margin-bottom:20px;">
+            <strong style="font-size:16px;">&#x26A0; Status Changed!</strong><br><br>
+            <span style="color:#666;">Previous:</span> <strong>{previous['status_title']}</strong><br>
+            <span style="color:#28a745;">New:</span> <strong>{current['status_title']}</strong>
+        </div>"""
+
+    return f"""<html><body style="font-family:Arial,sans-serif;max-width:620px;margin:auto;padding:24px;color:#333;">
+    <div style="background:#1a73e8;padding:20px 24px;border-radius:8px 8px 0 0;">
+        <h2 style="color:#fff;margin:0;">&#x1F4CB; USCIS Case Status Update</h2>
+    </div>
+    <div style="border:1px solid #ddd;border-top:none;padding:24px;border-radius:0 0 8px 8px;">
+        {change_banner}
+        <table style="width:100%;border-collapse:collapse;font-size:15px;">
+            <tr style="background:#f1f3f4;">
+                <td style="padding:10px 14px;font-weight:bold;width:38%;">Case Number</td>
+                <td style="padding:10px 14px;">{current['case_number']}</td>
+            </tr>
+            <tr>
+                <td style="padding:10px 14px;font-weight:bold;">Current Status</td>
+                <td style="padding:10px 14px;color:#1a73e8;font-weight:bold;">{current['status_title']}</td>
+            </tr>
+            <tr style="background:#f1f3f4;">
+                <td style="padding:10px 14px;font-weight:bold;">Description</td>
+                <td style="padding:10px 14px;">{current['status_description']}</td>
+            </tr>
+            <tr>
+                <td style="padding:10px 14px;font-weight:bold;">Checked At (UTC)</td>
+                <td style="padding:10px 14px;">{current['checked_at']}</td>
+            </tr>
         </table>
-        <p style="margin-top:20px;font-size:12px;color:#6c757d;">
-            This is an automated notification from your USCIS Case Tracker.<br>
-            <a href="https://egov.uscis.gov/casestatus/mycasestatus.do">Check manually on USCIS website</a>
+        <p style="margin-top:22px;">
+            <a href="https://egov.uscis.gov/casestatus/mycasestatus.do" 
+               style="background:#1a73e8;color:#fff;padding:10px 20px;border-radius:4px;text-decoration:none;font-weight:bold;">
+                Check on USCIS Website
+            </a>
         </p>
-    </body></html>
-    """
+        <p style="font-size:12px;color:#888;margin-top:20px;">This is an automated check from your GitHub USCIS tracker. Runs every 5 hours.</p>
+    </div>
+</body></html>"""
 
 
 def main():
-    print(f"[{datetime.utcnow().isoformat()}] Checking USCIS case status for {CASE_NUMBER}...")
-    current_status = get_case_status(CASE_NUMBER)
-    if not current_status:
-        print("Failed to fetch status. Exiting.")
+    print(f"[{datetime.utcnow().isoformat()}] Checking USCIS status for case {CASE_NUMBER}...")
+    current = get_case_status(CASE_NUMBER)
+    if not current:
+        print("No status returned. Exiting.")
         return
 
-    print(f"Status: {current_status['status_title']}")
-    print(f"Description: {current_status['status_description']}")
+    print(f"Status title: {current['status_title']}")
+    print(f"Description:  {current['status_description']}")
 
-    last_status = load_last_status()
-    save_status(current_status)
+    last = load_last_status()
+    save_status(current)
 
-    if last_status is None:
-        # First run — always send email
-        subject = f"USCIS Case {CASE_NUMBER} - Initial Status Check"
-        body = build_email_body(current_status)
-        send_email(subject, body, is_html=True)
-        print("First run: status email sent.")
-    elif last_status["status_title"] != current_status["status_title"]:
-        # Status changed
-        subject = f"USCIS Status CHANGED for {CASE_NUMBER}: {current_status['status_title']}"
-        body = build_email_body(current_status, last_status)
-        send_email(subject, body, is_html=True)
-        print("Status changed: notification email sent.")
+    if last is None:
+        subject = f"USCIS Case {CASE_NUMBER} - First Status Check"
+        print("First run - sending initial status email.")
+    elif last.get("status_title") != current["status_title"]:
+        subject = f"\u26a0 USCIS STATUS CHANGED for {CASE_NUMBER}: {current['status_title']}"
+        print("Status changed - sending alert email.")
     else:
-        # No change — still send a periodic check-in email
-        subject = f"USCIS Case {CASE_NUMBER} - No Change ({current_status['status_title']})"
-        body = build_email_body(current_status, last_status)
-        send_email(subject, body, is_html=True)
-        print("No change detected. Periodic check-in email sent.")
+        subject = f"USCIS Case {CASE_NUMBER} - Check-in ({current['status_title']})"
+        print("No change - sending periodic check-in email.")
+
+    send_email(subject, build_email_body(current, last))
 
 
 if __name__ == "__main__":
