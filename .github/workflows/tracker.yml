@@ -24,6 +24,11 @@ jobs:
         run: |
           pip install -r requirements.txt
 
+      - name: Install Playwright Chromium browser
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
       - name: Run USCIS tracker
         env:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
