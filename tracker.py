@@ -1,181 +1,204 @@
 import os
 import json
 import smtplib
-import urllib.request
-import urllib.parse
+import subprocess
+import re
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-# ── Configuration
-CASE_NUMBER    = "IOE0936799005"
-EMAIL_TO       = "swrp.vicky@gmail.com"
-EMAIL_FROM     = os.environ.get("EMAIL_FROM", "")
+# --- Configuration ---
+CASE_NUMBER   = "IOE0936799005"
+EMAIL_TO      = "swrp.vicky@gmail.com"
+EMAIL_FROM    = os.environ.get("EMAIL_FROM", "")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")
-STATUS_FILE    = "last_status.json"
-USCIS_URL      = "https://egov.uscis.gov/casestatus/mycasestatus.do"
-
-# USCIS public case status API (used by the official USCIS mobile app)
-USCIS_API      = "https://egov.uscis.gov/case-status/api"
+STATUS_FILE   = "last_status.json"
 
 
-def get_case_status(case_number: str):
-    """
-    Call the USCIS case-status REST API that powers the official app.
-    This endpoint is different from the website and does NOT go through Cloudflare.
-    """
-    url = f"{USCIS_API}/{case_number}"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Accept"         : "application/json",
-            "User-Agent"     : "okhttp/4.9.2",   # mimic USCIS Android app
-            "Referer"        : "https://egov.uscis.gov/",
-        }
+def get_case_status_curl(case_number: str):
+    """Use system curl to query the USCIS case status API."""
+    url = "https://egov.uscis.gov/casestatus/mycasestatus.do"
+    data = f"appReceiptNum={case_number}&caseStatusSearchBtn=CHECK+STATUS"
+    cmd = [
+        "curl", "-s", "-L",
+        "-X", "POST",
+        "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "-H", "Accept-Language: en-US,en;q=0.9",
+        "-H", "Content-Type: application/x-www-form-urlencoded",
+        "-H", "Origin: https://egov.uscis.gov",
+        "-H", "Referer: https://egov.uscis.gov/casestatus/landing.do",
+        "-H", "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "-H", "Cache-Control: no-cache",
+        "-b", "cookiefile",
+        "-c", "cookiefile",
+        "--data", data,
+        "--max-time", "30",
+        url
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+    html = result.stdout
+    print(f"[DEBUG] curl exit code: {result.returncode}")
+    print(f"[DEBUG] HTML length: {len(html)}")
+    print(f"[DEBUG] First 500 chars: {html[:500]}")
+    return html
+
+
+def get_first_cookie(case_number: str):
+    """Get a session cookie first from the landing page."""
+    cmd = [
+        "curl", "-s",
+        "-H", "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "-c", "cookiefile",
+        "--max-time", "20",
+        "https://egov.uscis.gov/casestatus/landing.do"
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    print(f"[DEBUG] Landing page status: {result.returncode}, length: {len(result.stdout)}")
+
+
+def parse_status_from_html(html: str):
+    """Extract status title and description from USCIS HTML response."""
+    if not html or len(html) < 100:
+        return None, None
+
+    # Check for Cloudflare block
+    if "cloudflare" in html.lower() or "cf-ray" in html.lower() or "just a moment" in html.lower():
+        print("[DEBUG] Cloudflare block detected")
+        return "BLOCKED", "Cloudflare challenge page detected"
+
+    # Try to extract status heading (h1 inside the result div)
+    title_match = re.search(
+        r'<div[^>]*class="[^"]*rows[^"]*"[^>]*>.*?<h1[^>]*>(.*?)</h1>',
+        html, re.DOTALL
     )
+    if not title_match:
+        title_match = re.search(r'<h1[^>]*>([^<]{5,100})</h1>', html)
+
+    desc_match = re.search(
+        r'<div[^>]*class="[^"]*rows[^"]*"[^>]*>.*?<p>(.*?)</p>',
+        html, re.DOTALL
+    )
+    if not desc_match:
+        desc_match = re.search(r'<p[^>]*class="[^"]*"[^>]*>(.*?)</p>', html, re.DOTALL)
+
+    title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip() if title_match else None
+    desc  = re.sub(r'<[^>]+>', '', desc_match.group(1)).strip()[:500] if desc_match else None
+
+    print(f"[DEBUG] Parsed title: {title}")
+    print(f"[DEBUG] Parsed desc: {desc}")
+    return title, desc
+
+
+def try_uscis_api(case_number: str):
+    """Try the internal USCIS JSON API."""
+    url = f"https://egov.uscis.gov/case-status/api/public/case-status/{case_number}"
+    cmd = [
+        "curl", "-s",
+        "-H", "Accept: application/json, text/plain, */*",
+        "-H", "Accept-Language: en-US,en;q=0.9",
+        "-H", "Referer: https://egov.uscis.gov/casestatus/landing.do",
+        "-H", "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "-H", "X-Requested-With: XMLHttpRequest",
+        "--max-time", "20",
+        url
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    print(f"[DEBUG] API curl exit: {result.returncode}, body: {result.stdout[:300]}")
+    if result.returncode != 0 or not result.stdout.strip():
+        return None, None
     try:
-        print(f"Calling USCIS API: {url}")
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
-        print(f"API response: {json.dumps(data, indent=2)[:500]}")
-
-        # Navigate the response structure
-        case = data.get("caseStatus", data)
-        title = (
-            case.get("formType", "") + " " +
-            case.get("subStatus", "")
-        ).strip()
-        if not title:
-            title = case.get("current_case_status_text_en",
-                    case.get("status", "")).strip()
-        desc  = case.get("current_case_status_desc_en",
-                case.get("description", "")).strip()
-
-        if not title:
-            print("Could not parse title from response.")
-            return None
-
-        return {
-            "case_number"       : case_number,
-            "status_title"      : title,
-            "status_description": desc or "See USCIS website for details.",
-            "checked_at"        : datetime.utcnow().isoformat() + "Z",
-        }
+        data = json.loads(result.stdout)
+        # Expected: {"caseStatus": {"formType": ..., "currentCaseStatus": ..., "currentCaseStatusDescription": ...}}
+        cs = data.get("caseStatus", data)
+        title = cs.get("currentCaseStatus") or cs.get("receiptNumber") or str(cs)[:100]
+        desc  = cs.get("currentCaseStatusDescription", "")[:500]
+        return title, desc
     except Exception as e:
-        print(f"API call failed: {e}")
-        return None
+        print(f"[DEBUG] JSON parse error: {e}")
+        return None, None
 
 
 def load_last_status():
     if os.path.exists(STATUS_FILE):
         with open(STATUS_FILE) as f:
             return json.load(f)
-    return None
+    return {}
 
 
-def save_status(status):
+def save_status(status: dict):
     with open(STATUS_FILE, "w") as f:
-        json.dump(status, f, indent=2)
+        json.dump(status, f)
 
 
-def send_email(subject, body):
-    if not EMAIL_FROM or not EMAIL_PASSWORD:
-        print("Email credentials missing.")
-        return False
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = EMAIL_FROM
-        msg["To"]      = EMAIL_TO
-        msg.attach(MIMEText(body, "html"))
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-            s.login(EMAIL_FROM, EMAIL_PASSWORD)
-            s.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
-        print(f"Email sent to {EMAIL_TO}")
-        return True
-    except Exception as e:
-        print(f"Email failed: {e}")
-        return False
-
-
-def build_email_body(current, previous=None):
-    change_banner = ""
-    if previous and previous.get("status_title") != current["status_title"]:
-        change_banner = f"""
-        <div style="background:#fff3cd;border-left:5px solid #ffc107;
-                    padding:14px 18px;margin-bottom:20px;border-radius:4px;">
-          <strong>&#x26A0; Status Changed!</strong><br><br>
-          Previous: <strong>{previous['status_title']}</strong><br>
-          New: <strong style="color:#1a73e8;">{current['status_title']}</strong>
-        </div>"""
-
-    is_err = any(w in current["status_title"].lower()
-                 for w in ("failed","blocked","manually","error"))
-    color  = "#d32f2f" if is_err else "#2e7d32"
-
-    return f"""<html><body style="font-family:Arial,sans-serif;max-width:640px;
-                               margin:auto;padding:20px;color:#333;">
-  <div style="background:#1a73e8;padding:20px 24px;border-radius:8px 8px 0 0;">
-    <h2 style="color:#fff;margin:0;">&#x1F4CB; USCIS Case Status Update</h2>
-  </div>
-  <div style="border:1px solid #ddd;border-top:none;padding:24px;
-              border-radius:0 0 8px 8px;background:#fff;">
-    {change_banner}
-    <table style="width:100%;border-collapse:collapse;font-size:15px;">
-      <tr style="background:#f1f3f4;">
-        <td style="padding:10px 14px;font-weight:bold;width:36%;">Case Number</td>
-        <td style="padding:10px 14px;">{current['case_number']}</td></tr>
-      <tr>
-        <td style="padding:10px 14px;font-weight:bold;">Current Status</td>
-        <td style="padding:10px 14px;font-weight:bold;color:{color};">
-          {current['status_title']}</td></tr>
-      <tr style="background:#f1f3f4;">
-        <td style="padding:10px 14px;font-weight:bold;">Description</td>
-        <td style="padding:10px 14px;">{current['status_description']}</td></tr>
-      <tr>
-        <td style="padding:10px 14px;font-weight:bold;">Checked At (UTC)</td>
-        <td style="padding:10px 14px;">{current['checked_at']}</td></tr>
-    </table>
-    <p style="margin-top:22px;">
-      <a href="{USCIS_URL}" style="background:#1a73e8;color:#fff;
-         padding:10px 22px;border-radius:4px;text-decoration:none;font-weight:bold;">
-        &#x1F517; Check on USCIS Website
-      </a>
-    </p>
-    <p style="font-size:12px;color:#888;margin-top:16px;">
-      Automated check &middot; Runs every 5 hours via GitHub Actions
-    </p>
-  </div>
-</body></html>"""
+def send_email(subject: str, body: str):
+    msg = MIMEMultipart()
+    msg["From"]    = EMAIL_FROM
+    msg["To"]      = EMAIL_TO
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(EMAIL_FROM, EMAIL_PASSWORD)
+        server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+    print("[INFO] Email sent successfully.")
 
 
 def main():
-    print(f"[{datetime.utcnow().isoformat()}Z] Checking USCIS case: {CASE_NUMBER}")
-    current = get_case_status(CASE_NUMBER)
+    print(f"[INFO] Starting USCIS tracker at {datetime.now().isoformat()}")
+    print(f"[INFO] Case number: {CASE_NUMBER}")
 
-    if current is None:
-        current = {
-            "case_number"       : CASE_NUMBER,
-            "status_title"      : "Check Manually - automated fetch failed",
-            "status_description": (
-                f"Could not retrieve status automatically. "
-                f"Please visit {USCIS_URL} and enter {CASE_NUMBER}."
-            ),
-            "checked_at": datetime.utcnow().isoformat() + "Z",
-        }
+    # Step 1: Try JSON API first
+    title, desc = try_uscis_api(CASE_NUMBER)
 
-    print(f"Final status: {current['status_title']}")
+    # Step 2: Fall back to HTML form POST with cookie session
+    if not title:
+        print("[INFO] JSON API failed, trying HTML form POST...")
+        get_first_cookie(CASE_NUMBER)
+        html = get_case_status_curl(CASE_NUMBER)
+        title, desc = parse_status_from_html(html)
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
+
+    if not title or title == "BLOCKED":
+        subject = f"USCIS Tracker - Manual Check Needed ({now_str})"
+        body = (
+            f"Case Number: {CASE_NUMBER}\n"
+            f"Check Time:  {now_str}\n\n"
+            f"Automated fetch was blocked. Please check manually:\n"
+            f"https://egov.uscis.gov/casestatus/landing.do\n\n"
+            f"Debug info: title={title}, desc={desc}"
+        )
+        send_email(subject, body)
+        print("[WARN] Sent fallback email.")
+        return
+
     last = load_last_status()
-    save_status(current)
+    last_title = last.get("title", "")
 
-    if last is None:
-        subject = f"USCIS Case {CASE_NUMBER} - Initial Status Check"
-    elif last.get("status_title") != current["status_title"]:
-        subject = f"\u26a0\ufe0f USCIS STATUS CHANGED - {CASE_NUMBER}: {current['status_title']}"
+    if title != last_title:
+        subject = f"USCIS Status CHANGED: {title}"
+        body = (
+            f"Your USCIS case status has CHANGED!\n\n"
+            f"Case Number: {CASE_NUMBER}\n"
+            f"New Status:  {title}\n"
+            f"Description: {desc}\n\n"
+            f"Checked at:  {now_str}\n"
+            f"Check online: https://egov.uscis.gov/casestatus/landing.do"
+        )
+        print(f"[INFO] Status CHANGED: {last_title!r} -> {title!r}")
     else:
-        subject = f"USCIS {CASE_NUMBER} - Periodic Check ({current['status_title'][:50]})"
+        subject = f"USCIS Status Update: {title} ({now_str})"
+        body = (
+            f"Case Number: {CASE_NUMBER}\n"
+            f"Current Status: {title}\n"
+            f"Description: {desc}\n\n"
+            f"Checked at: {now_str}\n"
+            f"Check online: https://egov.uscis.gov/casestatus/landing.do"
+        )
+        print(f"[INFO] Status unchanged: {title!r}")
 
-    send_email(subject, build_email_body(current, last))
+    send_email(subject, body)
+    save_status({"title": title, "desc": desc, "checked_at": now_str})
+    print("[INFO] Done.")
 
 
 if __name__ == "__main__":
