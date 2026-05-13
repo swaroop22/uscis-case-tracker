@@ -7,7 +7,7 @@ on:
 
 jobs:
   check-status:
-    runs-on: ubuntu-22.04   # use 22.04 - avoids libasound2 issue on 24.04
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
@@ -19,15 +19,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Install Python dependencies
-        run: |
-          pip install -r requirements.txt
-
-      - name: Install Playwright Chromium browser
-        run: |
-          playwright install chromium
-          playwright install-deps chromium
 
       - name: Run USCIS tracker
         env:
